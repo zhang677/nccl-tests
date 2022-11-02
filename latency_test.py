@@ -1,11 +1,13 @@
 import fcntl
-import os
 import socket
 import torch
 import torch.distributed as dist
-import time 
+import time
+import math 
 
-MB = (1<<10) * 1e3
+MB = int((1<<10) * 1e3)
+GB = int((1<<20) * 1e3)
+Byte = 4
 def printflock(*msgs):
     """ solves multi-process interleaved print problem """
     with open(__file__, "r") as fh:
@@ -15,35 +17,27 @@ def printflock(*msgs):
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
 
-def test(nbytes,type):
+def store(time,bandwidth):
+  f = open("tmp.txt","w")
+  f.write(str(time)+','+str(bandwidth))
+  f.close()
+
+def load():
+  f = open("tmp.txt","r")
+  ln = f.readline().split(",")
+  f.close()
+  return (float(ln[0]),float(ln[1]))
+
+def test(wsize,nbytes,type):
   warmup = 5
   repeat = 25
-  local_rank = int(os.environ["LOCAL_RANK"])
-  torch.cuda.set_device(local_rank)
-  device = torch.device("cuda", local_rank)
+  rank = dist.get_rank()
+  torch.cuda.set_device(rank)
+  device = torch.device("cuda", rank)
   hostname = socket.gethostname()
 
-  gpu = f"[{hostname}-{local_rank}]"
-
-  os.environ["OMP_NUM_THREADS"] = "1"
-  os.environ['MASTER_ADDR'] = '127.0.0.1'
-  os.environ['MASTER_PORT'] = '29500'
-
-  dist.init_process_group(
-      backend=dist.Backend.NCCL,
-      init_method='env://',
-      world_size=2,
-      rank=local_rank
-  )
-
-  assert dist.is_initialized()
-  assert dist.is_nccl_available()
-
-  # global rank
-  rank = dist.get_rank()
-  world_size = dist.get_world_size()
-
-  # test all-reduce
+  gpu = f"[{hostname}-{rank}]"
+  
   buf = torch.randn(nbytes // 4).to(device)
 
   torch.cuda.synchronize()
@@ -67,16 +61,59 @@ def test(nbytes,type):
   dist.barrier()
 
   if rank == 0:
-      printflock(f"pt={torch.__version__}, cuda={torch.version.cuda}, nccl={torch.cuda.nccl.version()}")
-      printflock(f"device compute capabilities={torch.cuda.get_device_capability()}")
-      printflock(f"pytorch compute capabilities={torch.cuda.get_arch_list()}")
-      avg_time = (end - begin) * 1e6 / repeat
-      alg_band = nbytes / MB / (end - begin)
-      if type == "b": 
-        bus_band = alg_band
-      elif type == "a":
-        bus_band = 2 * (world_size - 1) / world_size * alg_band
-      printflock(f"{gpu}, time {round(avg_time,2)} us, Bus bandwidth {round(bus_band,2)} MB/s")
+    avg_time_s = (end - begin) / repeat
+    alg_band = nbytes / avg_time_s
+    if type == "b": 
+      bus_band = alg_band
+    elif type == "a":
+      bus_band = 2 * (wsize - 1) / wsize * alg_band
+    store(avg_time_s,alg_band)
+    printflock(f"{gpu}, Bytes: {nbytes} B,Time: {round(avg_time_s * 1e6,2)} us, Bus bandwidth: {round(bus_band / GB,2)} GB/s")
+    return (avg_time_s,alg_band)
+
+def test_latency(wsize,it=3,type="a"):
+  latency = 0
+  for i in range(it):
+    nbytes = int(Byte << i)
+    test(wsize,nbytes,type)
+    dist.barrier()
+    (t,_) = load()
+    latency += t
+  return latency / it
+
+def test_bandwidth(wsize,maxbytes,type="a"):
+  test(wsize,maxbytes,type)
+  dist.barrier()
+  (_, bandwidth) = load()
+  return bandwidth
+
+def test_ab(wsize,type="a"):
+  assert torch.cuda.is_available()
+  assert torch.cuda.device_count() == wsize
+
+  dist.init_process_group(
+      backend=dist.Backend.NCCL,
+      init_method='env://',
+      world_size=wsize,
+  )
+
+  device = torch.device("cuda",dist.get_rank())
+  max_nbytes = torch.tensor(torch.cuda.mem_get_info(device)[0]).to(device)
+  dist.all_reduce(max_nbytes,op=dist.ReduceOp.MIN)
+  max_nbytes = min(int (4 * GB), int (GB << int(math.log2(max_nbytes.item()/GB))))
+  if dist.get_rank() == 0:
+    printflock(f"max_nbytes: {max_nbytes} B")
+  
+  alpha = test_latency(wsize)
+  beta = 1 / test_bandwidth(wsize, max_nbytes)
+  dist.barrier()
+
+  return (alpha,beta)
+  
+
 
 if __name__ == "__main__":
-  test(int((1<<10) * MB),"a")
+  (alpha,beta) = test_ab(4,"b")
+  if dist.get_rank() == 0:
+    store(alpha,beta)
+    printflock(f"alpha(us): {round(alpha * 1e6,2)}, beta(us/GB): {round(beta * 1e6 * GB,2)}")
